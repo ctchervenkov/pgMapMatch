@@ -430,6 +430,54 @@ class mapMatcher():
 
         self.timing['getPoints'] += (time.time()-starttime)
 
+    def findShortestPathForMapMatchedRoute(self):
+
+        if self.bestRoute is None or self.traceLineStr is None or self.startEndPts is None:
+            print("First run map-matching!")
+            return
+
+        startEdge = self.bestRoute[0]
+        endEdge = self.bestRoute[-1]
+        traceLineStr = self.traceLineStr
+        startEndPts = self.startEndPts
+
+        self.clearCurrentRoutes()
+
+        # reset from stored values
+        self.traceLineStr = traceLineStr
+        self.startEndPts = startEndPts
+
+        # get position on start edge
+        cmd = '''SELECT ST_LineLocatePoint(s.%(streetGeomCol)s, %(pos)s) AS pos FROM %(streetsTable)s s WHERE s.%(streetIdCol)s = %(edge)s;
+              ''' % dict(self.cmdDict, **{'edge': str(startEdge),
+                                          'pos': self.startEndPts[0]})
+
+        pos1 = self.db.execfetch(cmd)
+        pos1 = pos1[0][0]
+
+        # get position on end edge
+        cmd = '''SELECT ST_LineLocatePoint(s.%(streetGeomCol)s, %(pos)s) AS pos FROM %(streetsTable)s s WHERE s.%(streetIdCol)s = %(edge)s;
+              ''' % dict(self.cmdDict, **{'edge': str(endEdge),
+                                          'pos': self.startEndPts[1]})
+
+        pos2 = self.db.execfetch(cmd)
+        pos2 = pos2[0][0]
+
+        # route
+        cmd = '''SELECT id2 as edge 
+                 FROM pgr_trsp('SELECT %(streetIdCol)s, %(source)s, %(target)s, %(cost)s, %(reverse_cost)s FROM %(streetsTable)s', 
+                                %(n1)s, %(pos1)s, %(n2)s, %(pos2)s, true, true);
+              ''' % dict(self.cmdDict, **{'n1': str(startEdge),
+                                          'pos1': str(pos1),
+                                          'n2': str(endEdge),
+                                          'pos2': str(pos2)})
+
+        result = self.db.execfetch(cmd)
+        self.bestRoute = [r[0] for r in result][:-1]
+        self.matchStatus = 0
+
+        return
+
     def writeMatchToPostgres(self, edgeIdCol='edge_ids', writeEdgeIds=True, writeGeom=True, writeMatchScore=True, writeLLs=False):
         """Writes the edges ids back to the traces table
         writeMatchScore estimates the probability of a good match
