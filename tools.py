@@ -150,6 +150,11 @@ class dbConnection():
             results = tmpcur.fetchall()
             return pd.DataFrame([[row[col] for col in colNames] for row in results], columns=colNames)
 
+    def close(self):
+        self.cursor.close()
+        self.connection.close()
+        return
+
     def report(self, ss):
         """
         A wrapper for "print".
