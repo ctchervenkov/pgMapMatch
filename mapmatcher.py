@@ -7,13 +7,14 @@ See Millard-Ball, Adam; Hampshire, Robert and Weinberger, Rachel,
      The pgMapMatch package."
 """
 
-import time
 import datetime
-import random
 import math
 import os
-import pandas as pd
+import random
+import time
+
 import numpy as np
+import pandas as pd
 from scipy import stats, sparse
 
 # pgMapMatch tools
@@ -194,13 +195,13 @@ class mapMatcher():
 
         # dictionary of common substitutions into SQL commands
         self.cmdDict = {'streetsTable': streetsTable, 'streetIdCol': streetIdCol, 'streetGeomCol': streetGeomCol,
-              'source': startNodeCol, 'target': endNodeCol,
-              'cost': travelCostCol, 'reverse_cost': travelCostReverseCol,
-              'km': streetLengthCol,
-              'kmh': speedLimitCol, 'fwayCols': '' if fwayCols.strip() == '' else ','+fwayCols,
-              'traceTable': traceTable, 'idName': idName,
-              'geomName': geomName, 'newGeomName': newGeomName, 'cleanedGeomName': cleanedGeomName,
-              'gpsError': gpsError, 'gpsError_fway': gpsError_fway}
+                        'source': startNodeCol, 'target': endNodeCol,
+                        'cost': travelCostCol, 'reverse_cost': travelCostReverseCol,
+                        'km': streetLengthCol,
+                        'kmh': speedLimitCol, 'fwayCols': '' if fwayCols.strip() == '' else ','+fwayCols,
+                        'traceTable': traceTable, 'idName': idName,
+                        'geomName': geomName, 'newGeomName': newGeomName, 'cleanedGeomName': cleanedGeomName,
+                        'gpsError': gpsError, 'gpsError_fway': gpsError_fway}
         fwayColList = [cc.strip() for cc in fwayCols.split(',')]
 
         # Check geometry types of streets
@@ -430,53 +431,92 @@ class mapMatcher():
 
         self.timing['getPoints'] += (time.time()-starttime)
 
-    def findShortestPathForMapMatchedRoute(self):
+    def getNearestEdgeId(self, point, radius=1000):
 
-        if self.bestRoute is None or self.traceLineStr is None or self.startEndPts is None:
-            print("First run map-matching!")
-            return
-
-        startEdge = self.bestRoute[0]
-        endEdge = self.bestRoute[-1]
-        traceLineStr = self.traceLineStr
-        startEndPts = self.startEndPts
-
-        self.clearCurrentRoutes()
-
-        # reset from stored values
-        self.traceLineStr = traceLineStr
-        self.startEndPts = startEndPts
-
-        # get position on start edge
-        cmd = '''SELECT ST_LineLocatePoint(s.%(streetGeomCol)s, %(pos)s) AS pos FROM %(streetsTable)s s WHERE s.%(streetIdCol)s = %(edge)s;
-              ''' % dict(self.cmdDict, **{'edge': str(startEdge),
-                                          'pos': self.startEndPts[0]})
-
-        pos1 = self.db.execfetch(cmd)
-        pos1 = pos1[0][0]
-
-        # get position on end edge
-        cmd = '''SELECT ST_LineLocatePoint(s.%(streetGeomCol)s, %(pos)s) AS pos FROM %(streetsTable)s s WHERE s.%(streetIdCol)s = %(edge)s;
-              ''' % dict(self.cmdDict, **{'edge': str(endEdge),
-                                          'pos': self.startEndPts[1]})
-
-        pos2 = self.db.execfetch(cmd)
-        pos2 = pos2[0][0]
-
-        # route
-        cmd = '''SELECT id2 as edge 
-                 FROM pgr_trsp('SELECT %(streetIdCol)s, %(source)s, %(target)s, %(cost)s, %(reverse_cost)s FROM %(streetsTable)s', 
-                                %(n1)s, %(pos1)s, %(n2)s, %(pos2)s, true, true);
-              ''' % dict(self.cmdDict, **{'n1': str(startEdge),
-                                          'pos1': str(pos1),
-                                          'n2': str(endEdge),
-                                          'pos2': str(pos2)})
+        cmd = '''SELECT s.%(streetIdCol)s FROM %(streetsTable)s s 
+                WHERE ST_DWithin(s.geom_way, %(point)s, %(radius)s)
+                ORDER BY ST_Distance(%(point)s, s.geom_way)
+                LIMIT 1;
+                ''' % dict(self.cmdDict, **{'point': str(point), 'radius': str(radius)})
 
         result = self.db.execfetch(cmd)
-        self.bestRoute = [r[0] for r in result][:-1]
-        self.matchStatus = 0
+        return result[0][0]
 
-        return
+    def getPositionOnEdge(self, edge, point):
+
+        cmd = '''SELECT ST_LineLocatePoint(s.%(streetGeomCol)s, %(point)s) AS pos FROM %(streetsTable)s s 
+                WHERE s.%(streetIdCol)s = %(edge)s;
+                ''' % dict(self.cmdDict, **{'edge': str(edge),
+                                            'point': str(point)})
+
+        pos = self.db.execfetch(cmd)
+        return pos[0][0]
+
+    def findShortestPath(self, edge1, pos1, edge2, pos2, verbose=False):
+
+        cmd = '''SELECT seq, id2 as edge_id, cost 
+                FROM pgr_trsp('SELECT %(streetIdCol)s, %(source)s, %(target)s, %(cost)s, %(reverse_cost)s 
+                                FROM %(streetsTable)s', 
+                                %(n1)s, %(pos1)s, %(n2)s, %(pos2)s, true, true);
+                ''' % dict(self.cmdDict, **{'n1': str(edge1),
+                                            'pos1': str(pos1),
+                                            'n2': str(edge2),
+                                            'pos2': str(pos2)})
+
+        result = self.db.execfetch(cmd)
+        edge_ids = [r[1] for r in result][:-1]
+        df = pd.DataFrame({"seq": [r[0] for r in result][:-1],
+                           "id": edge_ids,
+                           "travel_time": [(3600 * r[2]) for r in result][:-1]},
+                          index=range(0, len(edge_ids)))
+
+        # enriching route with more network info
+        if verbose:
+            cmd = '''SELECT id, osm_id, osm_name, km, kmh 
+                    FROM %(streetsTable)s
+                    WHERE id IN (%(ids)s);
+                    ''' % dict(self.cmdDict, **{'ids': ", ".join([str(i) for i in edge_ids])})
+
+            result = self.db.execfetch(cmd)
+            df1 = pd.DataFrame({"id": [r[0] for r in result][:-1],
+                                "osm_id": [r[1] for r in result][:-1],
+                                "osm_name": [r[2] for r in result][:-1],
+                                "km": [r[3] for r in result][:-1],
+                                "kmh": [r[4] for r in result][:-1]},
+                               index=range(0, len([r[0] for r in result][:-1])))
+
+            return pd.merge(df, df1, on="id", how="outer").sort_values("seq")
+
+        return df.sort_values("seq")
+
+    # def findShortestPathForMapMatchedRoute(self):
+    #
+    #     if self.bestRoute is None or self.traceLineStr is None or self.startEndPts is None:
+    #         print("First run map-matching!")
+    #         return
+    #
+    #     startEdge = self.bestRoute[0]
+    #     endEdge = self.bestRoute[-1]
+    #     traceLineStr = self.traceLineStr
+    #     startEndPts = self.startEndPts
+    #
+    #     self.clearCurrentRoutes()
+    #
+    #     # reset from stored values
+    #     self.traceLineStr = traceLineStr
+    #     self.startEndPts = startEndPts
+    #
+    #     # get position on start edge
+    #     pos1 = self.getPositionOnEdge(startEdge, startEndPts[0])
+    #
+    #     # get position on end edge
+    #     pos2 = self.getPositionOnEdge(endEdge, startEndPts[1])
+    #
+    #     # route
+    #     self.bestRoute = self.findShortestPath(startEdge, pos1, endEdge, pos2)
+    #     self.matchStatus = 0
+    #
+    #     return
 
     def writeMatchToPostgres(self, edgeIdCol='edge_ids', writeEdgeIds=True, writeGeom=True, writeMatchScore=True, writeLLs=False):
         """Writes the edges ids back to the traces table
@@ -502,7 +542,7 @@ class mapMatcher():
             cmd = '''UPDATE %(traceTable)s SET ''' % cDict
             if writeEdgeIds:    cmd += '''%(edgeIdCol)s = ARRAY%(edges)s,''' % cDict
             if writeMatchScore:
-                if np.isnan(match_score): 
+                if np.isnan(match_score):
                     cmd += 'match_score=Null,'
                 else:
                     cmd += 'match_score=%s,' % np.float32(match_score)   # float32 needed to avoid underflow with very low scores
@@ -822,7 +862,7 @@ class mapMatcher():
             frcsAlong = self.ptsDf[self.ptsDf.edge==route[-1][0]].loc[nid:,'frcalong']
             threshold = 0.1 # how many km the furthest GPS ping has to be along, in order to add a uturn
             if ((route[-1][1] == 0 and frcsAlong.max()*self.edgesDf.loc[route[-1][0],'km'] > threshold) or
-                (route[-1][1] == 1 and (1-frcsAlong.min())*self.edgesDf.loc[route[-1][0],'km'] > threshold)):  
+                    (route[-1][1] == 1 and (1-frcsAlong.min())*self.edgesDf.loc[route[-1][0],'km'] > threshold)):
                 fullroute.append(fullroute[-1])
                 uturnFrcs[-1] = (frcsAlong.min(), frcsAlong.max())
                 uturnFrcs.append(-1)
@@ -838,8 +878,8 @@ class mapMatcher():
         lastEdgeLength = self.edgesDf.loc[self.bestRoute[-1], 'km']
         frc = self.ptsDf.frcalong[self.ptsDf.rownum == int(d[-1]/2)].values[0]
         if d[-1] % 2 == 1: frc = 1-frc  # reverse
-        while (len(self.bestRoute) > 1 and 
-              (lastEdgeLength*frc < 0.005 or (self.allowFinalUturn is False and self.bestRoute[-1] == self.bestRoute[-2]))):
+        while (len(self.bestRoute) > 1 and
+               (lastEdgeLength*frc < 0.005 or (self.allowFinalUturn is False and self.bestRoute[-1] == self.bestRoute[-2]))):
             self.bestRoute = self.bestRoute[:-1]
             self.uturnFrcs = self.uturnFrcs[:-1]
             lastEdgeLength, frc = 1, 1
@@ -1070,7 +1110,7 @@ class mapMatcher():
         # PostGIS now has a Frechet function. But this seems much slower than the implementation here, so don't use it
 
         if 1 or float(self.postgis_version.split('.')[0]) < 3 and float(self.postgis_version.split('.')[1]) < 4:
-                # This is placeholder pending ST_FrechetDistance() in PostGIS 2.4.0
+            # This is placeholder pending ST_FrechetDistance() in PostGIS 2.4.0
             if self.traceId is not None:
                 frechetGeomName = self.cleanedGeomName if self.cleanedGeomName else self.geomName
                 traceLength = self.db.execfetch('SELECT ST_Length(%(frechetGeomName)s) FROM %(traceTable)s WHERE %(idName)s=%(traceId)s;' % dict(self.cmdDict, **{'traceId': self.traceId, 'frechetGeomName': frechetGeomName}))[0][0]
@@ -1298,7 +1338,7 @@ class qualityPredictor():
         engine = mmt.getPgEngine(pgLogin=pgInfo)
 
         df.pr_good.to_sql('tmpimport', engine, if_exists='replace')
-        self.db.fix_permissions_of_new_table('tmpimport') 
+        self.db.fix_permissions_of_new_table('tmpimport')
         print('Merging and cleaning up')
         self.db.execute('ALTER TABLE %s DROP COLUMN IF EXISTS pr_good;' % table)
         self.db.execute('ALTER TABLE %s ADD COLUMN pr_good real;' % table)
